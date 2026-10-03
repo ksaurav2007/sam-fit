@@ -1,0 +1,47 @@
+import {Router} from "express";import multer from "multer";import {v2 as cloud} from "cloudinary";import {z} from "zod";
+import {db,dayRange,wrap} from "../utils/db.js";import {requireAuth} from "../middleware/auth.js";import {targets} from "../utils/targets.js";import * as ai from "../ai/index.js";import {findFood} from "../services/foods.js";import {price} from "../services/foodsCore.js";
+const r=Router();r.use(requireAuth);
+const up=multer({storage:multer.memoryStorage(),limits:{fileSize:6*1024*1024},fileFilter:(q,f,cb)=>/^image\/(jpeg|png|webp)$/.test(f.mimetype)?cb(null,true):cb(Object.assign(new Error("Upload a JPG, PNG or WebP image under 6 MB."),{status:400}))});
+async function store(uid,file,folder){if(!process.env.CLOUDINARY_CLOUD_NAME)return null;cloud.config({cloud_name:process.env.CLOUDINARY_CLOUD_NAME,api_key:process.env.CLOUDINARY_API_KEY,api_secret:process.env.CLOUDINARY_API_SECRET});
+  return new Promise((ok,no)=>cloud.uploader.upload_stream({folder:`samfit/${uid}/${folder}`},(e,x)=>e?no(e):ok(x.secure_url)).end(file.buffer))}
+const sum=(a,k)=>a.reduce((t,x)=>t+x[k],0);
+async function priced(i){if(i.kcal!=null)return{name:i.name,qty:i.qty,unit:i.unit||"pc",kcal:i.kcal,protein:i.protein||0,carbs:i.carbs||0,fat:i.fat||0,fiber:i.fiber||0};
+  const f=await findFood(i.name);if(!f)throw Object.assign(new Error(`We couldn't find "${i.name}". Try a simpler name (chapati, rice, dal) or enter its calories and macros.`),{status:422});return price(f,i.qty)}
+const mealBody=z.object({type:z.enum(["Breakfast","Lunch","Snack","Dinner"]),eatenAt:z.string().datetime().optional(),photoUrl:z.string().url().optional(),source:z.enum(["manual","ai","menu"]).default("manual"),
+  items:z.array(z.object({name:z.string().min(1),qty:z.number().positive().max(10000),unit:z.string().optional(),kcal:z.number().min(0).optional(),protein:z.number().optional(),carbs:z.number().optional(),fat:z.number().optional(),fiber:z.number().optional()})).min(1)});
+r.get("/user/profile",wrap(async(q,s)=>s.json(await db.user.findUnique({where:{id:q.userId},select:{email:true,profile:true,prefs:true,budget:true}}))));
+r.put("/user/profile",wrap(async(q,s)=>{const b=z.object({name:z.string(),age:z.number(),gender:z.string(),heightCm:z.number(),weightKg:z.number(),activity:z.number().int().min(0).max(3),goal:z.string(),override:z.object({kcalTarget:z.number().optional(),proteinTarget:z.number().optional(),waterTargetMl:z.number().optional()}).optional(),
+  prefs:z.object({dietType:z.string(),likes:z.array(z.string()),dislikes:z.array(z.string()),avoid:z.array(z.string()),allergies:z.array(z.string())}).optional()}).parse(q.body);
+const{override,prefs,...p}=b,profile=await db.profile.update({where:{userId:q.userId},data:{...p,...targets(p),...override}});if(prefs)await db.userPreference.update({where:{userId:q.userId},data:prefs});s.json(profile)}));
+r.get("/nutrition/today",wrap(async(q,s)=>{const[meals,p,water,wl]=await Promise.all([db.meal.findMany({where:{userId:q.userId,eatenAt:dayRange()},include:{items:true},orderBy:{eatenAt:"asc"}}),db.profile.findUnique({where:{userId:q.userId}}),db.waterLog.findMany({where:{userId:q.userId,at:dayRange()}}),db.workoutLog.count({where:{userId:q.userId,at:dayRange()}})]);
+const it=meals.flatMap(m=>m.items);s.json({meals,totals:{kcal:sum(it,"kcal"),protein:sum(it,"protein"),carbs:sum(it,"carbs"),fat:sum(it,"fat")},waterMl:sum(water,"ml"),workoutSets:wl,targets:p})}));
+r.get("/nutrition/resolve",wrap(async(q,s)=>{const f=await findFood(q.query.name);f?s.json(f):s.status(404).json({error:`No match for "${q.query.name}".`})}));
+r.get("/nutrition/foods",wrap(async(q,s)=>s.json(await db.food.findMany({orderBy:{name:"asc"}}))));
+r.post("/nutrition/meals",wrap(async(q,s)=>{const b=mealBody.parse(q.body),items=await Promise.all(b.items.map(priced));s.status(201).json(await db.meal.create({data:{userId:q.userId,type:b.type,source:b.source,photoUrl:b.photoUrl,eatenAt:b.eatenAt,items:{create:items}},include:{items:true}}))}));
+r.put("/nutrition/meals/:id",wrap(async(q,s)=>{const b=mealBody.parse(q.body),own=await db.meal.findFirst({where:{id:q.params.id,userId:q.userId}});if(!own)return s.status(404).json({error:"Meal not found."});const items=await Promise.all(b.items.map(priced));
+s.json(await db.meal.update({where:{id:own.id},data:{type:b.type,items:{deleteMany:{},create:items}},include:{items:true}}))}));
+r.delete("/nutrition/meals/:id",wrap(async(q,s)=>{const n=await db.meal.deleteMany({where:{id:q.params.id,userId:q.userId}});s.status(n.count?200:404).json({ok:!!n.count})}));
+r.get("/water/today",wrap(async(q,s)=>{const logs=await db.waterLog.findMany({where:{userId:q.userId,at:dayRange()},orderBy:{at:"desc"}});s.json({logs,totalMl:sum(logs,"ml")})}));
+r.post("/water/log",wrap(async(q,s)=>{const{ml}=z.object({ml:z.number().int().min(50).max(5000)}).parse(q.body);s.status(201).json(await db.waterLog.create({data:{userId:q.userId,ml}}))}));
+r.delete("/water/log/:id",wrap(async(q,s)=>{await db.waterLog.deleteMany({where:{id:q.params.id,userId:q.userId}});s.json({ok:true})}));
+r.get("/budget",wrap(async(q,s)=>{const now=new Date(),w=new Date(now-6*864e5),m=new Date(now.getFullYear(),now.getMonth(),1),[b,ex]=await Promise.all([db.budget.findUnique({where:{userId:q.userId}}),db.expense.findMany({where:{userId:q.userId,at:{gte:m}},orderBy:{at:"desc"}})]);
+const t=dayRange().gte;s.json({budget:b,expenses:ex,today:sum(ex.filter(e=>e.at>=t),"amount"),week:sum(ex.filter(e=>e.at>=w),"amount"),month:sum(ex,"amount")})}));
+r.post("/budget/expense",wrap(async(q,s)=>{const b=z.object({category:z.string(),note:z.string().optional(),amount:z.number().int().positive()}).parse(q.body);s.status(201).json(await db.expense.create({data:{userId:q.userId,...b}}))}));
+r.delete("/budget/expense/:id",wrap(async(q,s)=>{await db.expense.deleteMany({where:{id:q.params.id,userId:q.userId}});s.json({ok:true})}));
+r.get("/progress",wrap(async(q,s)=>{const from=new Date(Date.now()-90*864e5),[w,m]=await Promise.all([db.progressEntry.findMany({where:{userId:q.userId,at:{gte:from}},orderBy:{at:"asc"}}),db.mealItem.findMany({where:{meal:{userId:q.userId,eatenAt:{gte:from}}},select:{kcal:true,protein:true,meal:{select:{eatenAt:true}}}})]);
+const days={};m.forEach(i=>{const d=i.meal.eatenAt.toISOString().slice(0,10);days[d]=days[d]||{kcal:0,protein:0};days[d].kcal+=i.kcal;days[d].protein+=i.protein});s.json({weights:w,days})}));
+r.post("/progress",wrap(async(q,s)=>{const{weightKg}=z.object({weightKg:z.number().min(25).max(300)}).parse(q.body);s.status(201).json(await db.progressEntry.create({data:{userId:q.userId,weightKg}}))}));
+r.get("/workouts",wrap(async(q,s)=>s.json(await db.workout.findMany({where:{userId:q.userId},include:{exercises:{orderBy:{position:"asc"}}}}))));
+r.post("/workouts",wrap(async(q,s)=>{const b=z.object({title:z.string(),mode:z.enum(["Gym","Home"]),goal:z.string(),exercises:z.array(z.object({name:z.string(),sets:z.number().int().positive(),reps:z.string()}))}).parse(q.body);
+s.status(201).json(await db.workout.create({data:{userId:q.userId,title:b.title,mode:b.mode,goal:b.goal,exercises:{create:b.exercises.map((e,position)=>({...e,position}))}},include:{exercises:true}}))}));
+r.post("/workouts/log",wrap(async(q,s)=>{const b=z.object({exercise:z.string(),setNo:z.number().int().positive(),weightKg:z.number().min(0),reps:z.number().int().positive()}).parse(q.body);s.status(201).json(await db.workoutLog.create({data:{userId:q.userId,...b}}))}));
+const ctx=async uid=>{const[p,pr,t,b]=await Promise.all([db.profile.findUnique({where:{userId:uid}}),db.userPreference.findUnique({where:{userId:uid}}),db.mealItem.findMany({where:{meal:{userId:uid,eatenAt:dayRange()}}}),db.budget.findUnique({where:{userId:uid}})]);return{profile:p,preferences:pr,eatenToday:{kcal:sum(t,"kcal"),protein:sum(t,"protein")},budget:b}};
+r.post("/ai/analyze-meal",up.single("image"),wrap(async(q,s)=>{if(!q.file)return s.status(400).json({error:"Choose an image."});const url=await store(q.userId,q.file,"meal-photos");s.json({...(await ai.analyzeMeal(q.userId,q.file,url)),photoUrl:url,estimate:true})}));
+r.post("/ai/analyze-menu",up.single("image"),wrap(async(q,s)=>{if(!q.file)return s.status(400).json({error:"Choose an image."});const url=await store(q.userId,q.file,"menu-uploads");s.json({...(await ai.analyzeMenu(q.userId,q.file,url)),imageUrl:url})}));
+r.post("/menus",wrap(async(q,s)=>{const b=z.object({forDate:z.string(),imageUrl:z.string().optional(),meals:z.array(z.object({type:z.string(),items:z.array(z.string())}))}).parse(q.body);
+s.status(201).json(await db.menu.create({data:{userId:q.userId,forDate:new Date(b.forDate),imageUrl:b.imageUrl,items:{create:b.meals.flatMap(m=>m.items.map(name=>({mealType:m.type,name})))}},include:{items:true}}))}));
+r.get("/menus/latest",wrap(async(q,s)=>s.json(await db.menu.findFirst({where:{userId:q.userId},orderBy:{forDate:"desc"},include:{items:true}}))));
+r.post("/ai/generate-diet",wrap(async(q,s)=>{const m=await db.menu.findFirst({where:{userId:q.userId},orderBy:{forDate:"desc"},include:{items:true}});if(!m)return s.status(400).json({error:"Upload a menu first."});
+const plan=await ai.generateDiet({...(await ctx(q.userId)),menu:m.items.map(i=>({type:i.mealType,name:i.name}))});await db.dietPlan.create({data:{userId:q.userId,forDate:new Date(),plan}});s.json(plan)}));
+r.post("/ai/coach",wrap(async(q,s)=>{const{question}=z.object({question:z.string().min(2).max(500)}).parse(q.body);s.json(await ai.coach(await ctx(q.userId),question))}));
+export default r;
