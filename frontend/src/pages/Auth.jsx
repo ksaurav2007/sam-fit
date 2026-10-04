@@ -1,6 +1,6 @@
 import {useState} from "react";import {useAuth} from "../context/Auth.jsx";
 export default function Auth(){const{login,register}=useAuth(),[reg,setReg]=useState(false),[err,setErr]=useState(""),[busy,setBusy]=useState(false),
-  [f,setF]=useState({name:"",email:"",password:"",confirm:"",age:20,gender:"Male",heightCm:170,weightKg:65,activity:1,goal:"Build muscle"}),set=k=>e=>setF({...f,[k]:e.target.value});
+  [f,setF]=useState({name:"",email:"",password:"",confirm:"",age:20,gender:"Male",heightCm:170,weightKg:65,activity:1,goal:"Build muscle"}),set=k=>e=>setF({...f,[k]:k==="activity"?Number(e.target.value):e.target.value});
   async function submit(e){e.preventDefault();setErr("");if(reg&&f.password!==f.confirm)return setErr("Passwords do not match.");setBusy(true);
     try{reg?await register(f):await login({email:f.email,password:f.password})}catch(x){setErr(x.message)}setBusy(false)}
   const In=(l,k,t="text")=><label>{l}<br/><input type={t} value={f[k]} onChange={set(k)} required style={{width:"100%"}}/></label>;
